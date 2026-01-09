@@ -3,6 +3,12 @@ MinerU Tianshu - SQLite Task Database Manager
 天枢任务数据库管理器
 
 负责任务的持久化存储、状态管理和原子性操作
+
+架构说明 (Hybrid Queue):
+    - SQLite: 任务元数据存储、历史记录、结果管理
+    - Redis (可选): 高性能任务队列、优先级调度
+    - 当 Redis 可用时，队列操作由 Redis 处理
+    - 当 Redis 不可用时，自动回退到 SQLite
 """
 
 import sqlite3
@@ -12,6 +18,15 @@ from contextlib import contextmanager
 from typing import Optional, List, Dict
 from pathlib import Path
 from loguru import logger
+
+# 导入 Redis 队列（可选）
+try:
+    from redis_queue import get_redis_queue
+    REDIS_QUEUE_AVAILABLE = True
+except ImportError:
+    REDIS_QUEUE_AVAILABLE = False
+    def get_redis_queue():
+        return None
 
 
 class TaskDB:
@@ -148,7 +163,37 @@ class TaskDB:
             """,
                 (task_id, file_name, file_path, backend, json.dumps(options or {}), priority, user_id),
             )
+
+        # 入队到 Redis（如果可用）
+        self._enqueue_to_redis(task_id, priority, {
+            "file_name": file_name,
+            "backend": backend,
+        })
+
         return task_id
+
+    def _enqueue_to_redis(self, task_id: str, priority: int, task_data: dict = None) -> bool:
+        """
+        将任务加入 Redis 队列
+
+        Args:
+            task_id: 任务ID
+            priority: 优先级
+            task_data: 可选的任务快照数据
+
+        Returns:
+            bool: 是否成功入队到 Redis
+        """
+        if not REDIS_QUEUE_AVAILABLE:
+            return False
+
+        redis_queue = get_redis_queue()
+        if redis_queue:
+            try:
+                return redis_queue.enqueue(task_id, priority, task_data)
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to enqueue to Redis, SQLite fallback active: {e}")
+        return False
 
     def get_next_task(self, worker_id: str, max_retries: int = 3) -> Optional[Dict]:
         """
@@ -161,14 +206,25 @@ class TaskDB:
         Returns:
             task: 任务字典，如果没有任务返回 None
 
-        并发安全说明：
+        并发安全说明（SQLite 模式）：
             1. 使用 BEGIN IMMEDIATE 立即获取写锁
             2. UPDATE 时检查 status = 'pending' 防止重复拉取
             3. 检查 rowcount 确保更新成功
             4. 如果任务被抢走，立即重试而不是返回 None（避免不必要的等待）
+
+        Redis 模式：
+            1. 使用 BZPOPMIN 原子获取最高优先级任务
+            2. 任务自动移入 processing set
+            3. 从 SQLite 获取完整任务数据
         """
         from loguru import logger
 
+        # 尝试使用 Redis 队列（如果可用）
+        task = self._get_next_task_redis(worker_id)
+        if task is not None:
+            return task
+
+        # Redis 不可用或出错，回退到 SQLite
         for attempt in range(max_retries):
             try:
                 with self.get_cursor() as cursor:
@@ -235,6 +291,65 @@ class TaskDB:
         # 重试次数用尽，仍未获取到任务（高并发场景）
         logger.warning(f"⚠️  Failed to get task after {max_retries} attempts")
         return None
+
+    def _get_next_task_redis(self, worker_id: str) -> Optional[Dict]:
+        """
+        从 Redis 队列获取下一个任务
+
+        Args:
+            worker_id: Worker ID
+
+        Returns:
+            task: 任务字典，如果 Redis 不可用或无任务返回 None
+        """
+        if not REDIS_QUEUE_AVAILABLE:
+            return None
+
+        redis_queue = get_redis_queue()
+        if not redis_queue:
+            return None
+
+        try:
+            # 从 Redis 获取任务 ID（阻塞式，1秒超时）
+            task_id = redis_queue.dequeue(worker_id, timeout=1.0)
+            if not task_id:
+                return None
+
+            # 从 SQLite 获取完整任务数据
+            with self.get_cursor() as cursor:
+                cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+                task = cursor.fetchone()
+
+                if not task:
+                    # 任务在 Redis 中但不在 SQLite 中（异常情况）
+                    logger.error(f"❌ Task {task_id} found in Redis but not in SQLite")
+                    redis_queue.fail(task_id, worker_id, requeue=False)
+                    return None
+
+                # 更新 SQLite 中的任务状态
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'processing',
+                        started_at = CURRENT_TIMESTAMP,
+                        worker_id = ?
+                    WHERE task_id = ? AND status = 'pending'
+                    """,
+                    (worker_id, task_id),
+                )
+
+                if cursor.rowcount == 0:
+                    # 任务状态已经改变（可能被取消等）
+                    logger.warning(f"⚠️  Task {task_id} status changed, skipping")
+                    redis_queue.fail(task_id, worker_id, requeue=False)
+                    return None
+
+                logger.info(f"📤 [Redis] Task {task_id} claimed by worker {worker_id}")
+                return dict(task)
+
+        except Exception as e:
+            logger.error(f"❌ Redis dequeue failed, falling back to SQLite: {e}")
+            return None
 
     def update_task_status(
         self, task_id: str, status: str, result_path: str = None, error_message: str = None, worker_id: str = None
@@ -359,7 +474,36 @@ class TaskDB:
 
                 logger.debug(f"Status update failed: task_id={task_id}, status={status}, " f"worker_id={worker_id}")
 
+            # 通知 Redis 任务完成/失败（清理 processing set）
+            if success and status in ["completed", "failed"]:
+                self._notify_redis_task_done(task_id, worker_id or "", status)
+
             return success
+
+    def _notify_redis_task_done(self, task_id: str, worker_id: str, status: str):
+        """
+        通知 Redis 任务已完成/失败
+
+        从 processing set 中移除任务
+
+        Args:
+            task_id: 任务ID
+            worker_id: Worker ID
+            status: 最终状态 (completed/failed)
+        """
+        if not REDIS_QUEUE_AVAILABLE:
+            return
+
+        redis_queue = get_redis_queue()
+        if redis_queue:
+            try:
+                if status == "completed":
+                    redis_queue.complete(task_id, worker_id)
+                else:
+                    redis_queue.fail(task_id, worker_id, requeue=False)
+            except Exception as e:
+                # Redis 清理失败不影响任务完成
+                logger.warning(f"⚠️  Failed to notify Redis about task {task_id}: {e}")
 
     def get_task(self, task_id: str) -> Optional[Dict]:
         """
@@ -381,7 +525,7 @@ class TaskDB:
         获取队列统计信息
 
         Returns:
-            stats: 各状态的任务数量
+            stats: 各状态的任务数量，包含 Redis 队列信息（如果可用）
         """
         with self.get_cursor() as cursor:
             cursor.execute("""
@@ -390,7 +534,25 @@ class TaskDB:
                 GROUP BY status
             """)
             stats = {row["status"]: row["count"] for row in cursor.fetchall()}
-            return stats
+
+        # 添加 Redis 队列统计（如果可用）
+        if REDIS_QUEUE_AVAILABLE:
+            redis_queue = get_redis_queue()
+            if redis_queue:
+                try:
+                    redis_stats = redis_queue.get_stats()
+                    stats["_redis_enabled"] = True
+                    stats["_redis_pending"] = redis_stats.get("pending", 0)
+                    stats["_redis_processing"] = redis_stats.get("processing", 0)
+                except Exception as e:
+                    stats["_redis_enabled"] = False
+                    stats["_redis_error"] = str(e)
+            else:
+                stats["_redis_enabled"] = False
+        else:
+            stats["_redis_enabled"] = False
+
+        return stats
 
     def get_tasks_by_status(self, status: str, limit: int = 100) -> List[Dict]:
         """

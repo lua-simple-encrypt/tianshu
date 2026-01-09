@@ -2,7 +2,7 @@ import logging
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict
 import os
 
 import httpx
@@ -229,7 +229,7 @@ class TianshuParseTool(Tool):
                     logger.info(f"   📄 {file_name} ({len(file_content)} bytes)")
 
                     # 2. 提交任务
-                    logger.info(f"   ⬆️  提交任务...")
+                    logger.info("   ⬆️  提交任务...")
                     task_id = self._submit_file(
                         file_name, file_content, credentials,
                         backend, lang, formula_enable, priority
@@ -237,7 +237,7 @@ class TianshuParseTool(Tool):
                     logger.info(f"   ✅ Task ID: {task_id}")
 
                     # 3. 等待结果
-                    logger.info(f"   ⏳ 等待解析完成...")
+                    logger.info("   ⏳ 等待解析完成...")
                     result = self._wait_for_result(task_id, credentials, "markdown", max_wait)
 
                     logger.info(f"   ✅ 解析完成 ({len(result['content'])} 字符)")

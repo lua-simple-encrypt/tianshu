@@ -62,16 +62,16 @@ class TianshuProvider(ToolProvider):
                 "User-Agent": "Dify-Plugin-Tianshu/1.0"
             }
 
-            logger.info(f"📤 发送验证请求:")
+            logger.info("📤 发送验证请求:")
             logger.info(f"   URL: {test_url}")
-            logger.info(f"   Method: GET")
+            logger.info("   Method: GET")
             logger.info(f"   Headers: {headers}")
 
             try:
                 # 直接发送请求（已通过环境变量禁用代理）
                 response = httpx.get(test_url, headers=headers, timeout=10.0)
 
-                logger.info(f"📥 收到响应:")
+                logger.info("📥 收到响应:")
                 logger.info(f"   状态码: {response.status_code}")
                 logger.info(f"   响应头: {dict(response.headers)}")
                 logger.info(f"   请求的实际 URL: {response.url}")
@@ -125,10 +125,10 @@ class TianshuProvider(ToolProvider):
 
             except httpx.ConnectError as e:
                 logger.error(f"❌ 连接失败: {str(e)}")
-                logger.error(f"   请检查:")
-                logger.error(f"   1. Tianshu 服务是否正在运行")
+                logger.error("   请检查:")
+                logger.error("   1. Tianshu 服务是否正在运行")
                 logger.error(f"   2. URL 是否正确: {api_base_url}")
-                logger.error(f"   3. 网络连接是否正常")
+                logger.error("   3. 网络连接是否正常")
                 raise ValueError(f"Cannot connect to API server: {str(e)}")
 
             except httpx.RequestError as e:
@@ -141,6 +141,6 @@ class TianshuProvider(ToolProvider):
             raise ToolProviderCredentialValidationError(str(e))
 
         except Exception as e:
-            logger.exception(f"❌ 未预期的错误:")
+            logger.exception("❌ 未预期的错误:")
             logger.info("=" * 80)
             raise ToolProviderCredentialValidationError(f"Unexpected error: {str(e)}")
