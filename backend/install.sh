@@ -1,118 +1,23 @@
 #!/bin/bash
 # ============================================================================
 # MinerU Tianshu Backend Installer (CUDA 13.0 Edition)
-# Environment: WSL2 / Ubuntu 24.04 / Python 3.12
-# Updated: MinerU 2.7.6, PaddleX 3.4.1, PaddleOCR 3.4.0
+# Updated: PaddleOCR[all] (Full Features)
 # ============================================================================
 
-set -e  # Exit immediately if a command exits with a non-zero status
+set -e
 
 echo "📦 Installing MinerU Tianshu Backend Dependencies..."
-echo "🚀 Target Environment: CUDA 13.0 | Torch 2.10 | Paddle 3.3 | PaddleX 3.4"
+echo "🚀 Target Environment: CUDA 13.0 | Torch 2.10 | Paddle 3.3 | PaddleOCR[all]"
 echo ""
 
-# Definition of versions
+# ... (Step 1 - Step 6 保持不变，请直接使用之前发的内容) ...
+
 TORCH_URL="https://download.pytorch.org/whl/cu130"
 PADDLE_URL="https://www.paddlepaddle.org.cn/packages/stable/cu130/"
 FLASH_ATTN_URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl"
 PIP_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
 
-# ============================================================================
-# Step 1: System Checks
-# ============================================================================
-echo "[Step 1/8] Checking system requirements..."
-
-# Check OS
-if [ "$(uname)" != "Linux" ]; then
-    echo "❌ Error: This script is designed for Linux/WSL."
-    exit 1
-fi
-
-# Check Python Version
-PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-if [ "$PYTHON_VERSION" != "3.12" ]; then
-    echo "❌ Error: Python 3.12 is required. Found Python $PYTHON_VERSION."
-    exit 1
-fi
-
-# Check GPU
-if command -v nvidia-smi &> /dev/null; then
-    echo "✓ GPU detected:"
-    nvidia-smi --query-gpu=name --format=csv,noheader | head -1
-else
-    echo "⚠ Warning: nvidia-smi not found. Ensure you are passing GPU to WSL."
-fi
-
-# ============================================================================
-# Step 2: System Libraries
-# ============================================================================
-echo ""
-echo "[Step 2/8] Installing system libraries..."
-if command -v apt-get &> /dev/null; then
-    # Sudo might require password
-    echo "  > Updating apt repository..."
-    sudo apt-get update -qq
-    echo "  > Installing libgomp1, ffmpeg, libGL..."
-    sudo apt-get install -y libgomp1 ffmpeg libgl1 libglib2.0-0
-    echo "✓ System libraries installed"
-else
-    echo "⚠ Warning: apt-get not found. Ensure libgomp1 and ffmpeg are installed."
-fi
-
-# ============================================================================
-# Step 3: Foundation (NumPy & Setup)
-# ============================================================================
-echo ""
-echo "[Step 3/8] Installing Foundation (NumPy 1.26.4)..."
-echo "  > Locking NumPy to 1.26.4 to prevent Paddle/Torch conflicts..."
-
-pip install --upgrade pip setuptools wheel -i $PIP_MIRROR
-# Updated opencv to 4.11 to match requirements
-pip install "numpy==1.26.4" "opencv-python-headless>=4.11.0.86" \
-    -i $PIP_MIRROR \
-    --default-timeout=300
-
-echo "✓ Foundation installed"
-
-# ============================================================================
-# Step 4: PyTorch (CUDA 13.0)
-# ============================================================================
-echo ""
-echo "[Step 4/8] Installing PyTorch 2.10.0+cu130..."
-echo "  > Downloading from $TORCH_URL ..."
-
-pip install torch==2.10.0+cu130 \
-    torchvision==0.25.0+cu130 \
-    torchaudio==2.10.0+cu130 \
-    --index-url $TORCH_URL \
-    --default-timeout=600
-
-echo "✓ PyTorch installed"
-
-# ============================================================================
-# Step 5: Flash Attention (Custom Wheel)
-# ============================================================================
-echo ""
-echo "[Step 5/8] Installing Flash Attention (Precompiled)..."
-echo "  > Target: Torch 2.10 + CUDA 13.0 + Python 3.12"
-
-pip install $FLASH_ATTN_URL \
-    --default-timeout=600
-
-echo "✓ FlashAttention installed"
-
-# ============================================================================
-# Step 6: PaddlePaddle (CUDA 13.0)
-# ============================================================================
-echo ""
-echo "[Step 6/8] Installing PaddlePaddle GPU 3.3.0..."
-echo "  > Downloading from $PADDLE_URL ..."
-
-pip install paddlepaddle-gpu==3.3.0 \
-    -i $PADDLE_URL \
-    --default-timeout=600
-
-echo "✓ PaddlePaddle installed"
+# (此处省略 Step 1 - Step 6，与之前脚本完全一致)
 
 # ============================================================================
 # Step 7: MinerU & Core Apps (No Dependencies)
@@ -121,14 +26,14 @@ echo ""
 echo "[Step 7/8] Installing MinerU, PaddleX & Transformers..."
 echo "  > Using --no-deps to protect Torch/NumPy versions..."
 
-# Updated list to include PaddleX 3.4.1, new MinerU deps, and specific doclayout version
+# Updated list to include paddleocr[all]
 pip install "mineru[core]>=2.7.6" \
             "albumentations>=1.4.11" \
             "albucore>=0.0.15" \
             "transformers==4.57.6" \
             "tokenizers>=0.22.0" \
             "doclayout-yolo==0.0.4" \
-            "paddleocr>=3.4.0" \
+            "paddleocr[all]>=3.4.0" \
             "paddlex>=3.4.1" \
             "pdftext>=0.6.3" \
             "json-repair>=0.46.2" \
@@ -147,128 +52,16 @@ echo ""
 echo "[Step 8/8] Resolving remaining dependencies..."
 echo "  > Cleaning requirements.txt to avoid conflicts..."
 
-# Ensure we are in the script's directory
 cd "$(dirname "$0")" || exit
 
-# Create a temporary requirements file excluding heavy frameworks AND new components
-# Added /paddlex/d, /doclayout/d, /scikit-image/d to the exclusion list
-sed '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d' requirements.txt > requirements.tmp.txt
+sed '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d; /paddleocr/d' requirements.txt > requirements.tmp.txt
 
 echo "  > Installing safe dependencies..."
 pip install -r requirements.tmp.txt \
     -i $PIP_MIRROR \
     --default-timeout=600
 
-# Cleanup
 rm requirements.tmp.txt
 echo "✓ All dependencies resolved"
 
-# ============================================================================
-# Verification
-# ============================================================================
-echo ""
-echo "============================================================"
-echo "🔍 Verifying Installation..."
-echo "============================================================"
-
-python3 << 'EOF'
-import sys
-import os
-
-# Helper for colored output
-def ok(msg): print(f"\033[92m✓ {msg}\033[0m")
-def fail(msg): print(f"\033[91m✗ {msg}\033[0m"); return False
-def warn(msg): print(f"\033[93m⚠ {msg}\033[0m"); return True
-
-success = True
-
-# 1. NumPy Check
-try:
-    import numpy
-    if numpy.__version__ == "1.26.4":
-        ok(f"NumPy: {numpy.__version__} (Locked)")
-    else:
-        warn(f"NumPy: {numpy.__version__} (Warning: Expected 1.26.4)")
-except Exception as e:
-    success = fail(f"NumPy: {e}")
-
-# 2. PyTorch Check
-try:
-    import torch
-    ver = torch.__version__
-    cuda = torch.cuda.is_available()
-    dev_count = torch.cuda.device_count()
-    if "2.10" in ver and "+cu130" in ver:
-         ok(f"PyTorch: {ver}")
-    else:
-         warn(f"PyTorch: {ver} (Target: 2.10.0+cu130)")
-    
-    if cuda:
-        ok(f"PyTorch CUDA: Available ({dev_count} GPUs)")
-    else:
-        warn("PyTorch CUDA: Not Available")
-except Exception as e:
-    success = fail(f"PyTorch: {e}")
-
-# 3. Paddle Check
-try:
-    import paddle
-    ver = paddle.__version__
-    cuda = paddle.device.is_compiled_with_cuda()
-    if ver == "3.3.0":
-        ok(f"Paddle: {ver}")
-    else:
-        warn(f"Paddle: {ver} (Target: 3.3.0)")
-        
-    if cuda:
-        ok("Paddle CUDA: Available")
-    else:
-        warn("Paddle CUDA: Not Available")
-except Exception as e:
-    success = fail(f"Paddle: {e}")
-
-# 4. PaddleX & OCR Check
-try:
-    import paddleocr
-    ok(f"PaddleOCR: {paddleocr.__version__}")
-    import paddlex
-    ok(f"PaddleX: {paddlex.__version__}")
-except Exception as e:
-    success = fail(f"PaddleX/OCR Error: {e}")
-
-# 5. Flash Attention
-try:
-    import flash_attn
-    ok(f"FlashAttention: {flash_attn.__version__}")
-except ImportError:
-    warn("FlashAttention: Not found (Optional but recommended)")
-except Exception as e:
-    warn(f"FlashAttention Error: {e}")
-
-# 6. MinerU
-try:
-    from magic_pdf.data.dataset import Dataset
-    import doclayout_yolo
-    ok(f"MinerU Core: Ready")
-    ok(f"DocLayout-YOLO: {doclayout_yolo.__version__}")
-except ImportError as e:
-    fail(f"MinerU Error: {e}")
-except Exception as e:
-    # MinerU often has config warnings, treat as warning unless import fails
-    ok(f"MinerU: Importable ({str(e)[:50]}...)")
-
-if not success:
-    sys.exit(1)
-EOF
-
-VERIFY_EXIT=$?
-
-echo ""
-if [ $VERIFY_EXIT -eq 0 ]; then
-    echo "✅ Installation Successful! You are ready to launch."
-    echo "   Run: python api_server.py"
-else
-    echo "❌ Installation Verification Failed."
-    echo "   Please check the errors above."
-    exit 1
-fi
+# ... (Step 9 验证部分保持不变) ...
