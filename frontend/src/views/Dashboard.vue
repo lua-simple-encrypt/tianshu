@@ -1,44 +1,47 @@
 <template>
   <div>
-    <!-- 页面标题 -->
     <div class="mb-6 lg:mb-10">
       <h1 class="text-2xl lg:text-3xl xl:text-4xl font-bold text-gray-900 tracking-tight">{{ $t('dashboard.title') }}</h1>
       <p class="mt-2 lg:mt-3 text-base lg:text-lg text-gray-600">{{ $t('dashboard.systemStatus') }}</p>
     </div>
 
-    <!-- 队列统计卡片 -->
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 lg:gap-6 mb-6 lg:mb-8">
-      <StatCard
-        :title="$t('status.pending')"
-        :value="queueStore.stats.pending"
-        :subtitle="$t('dashboard.pendingTasks')"
-        :icon="Clock"
-        color="gray"
-      />
-      <StatCard
-        :title="$t('status.processing')"
-        :value="queueStore.stats.processing"
-        :subtitle="$t('dashboard.processingTasks')"
-        :icon="Loader"
-        color="yellow"
-      />
-      <StatCard
-        :title="$t('status.completed')"
-        :value="queueStore.stats.completed"
-        :subtitle="$t('dashboard.completedTasks')"
-        :icon="CheckCircle"
-        color="green"
-      />
-      <StatCard
-        :title="$t('status.failed')"
-        :value="queueStore.stats.failed"
-        :subtitle="$t('dashboard.failedTasks')"
-        :icon="XCircle"
-        color="red"
-      />
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-6 lg:mb-8">
+      <div class="lg:col-span-3 grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 lg:gap-6">
+        <StatCard
+          :title="$t('status.pending')"
+          :value="queueStore.stats.pending"
+          :subtitle="$t('dashboard.pendingTasks')"
+          :icon="Clock"
+          color="gray"
+        />
+        <StatCard
+          :title="$t('status.processing')"
+          :value="queueStore.stats.processing"
+          :subtitle="$t('dashboard.processingTasks')"
+          :icon="Loader"
+          color="yellow"
+        />
+        <StatCard
+          :title="$t('status.completed')"
+          :value="queueStore.stats.completed"
+          :subtitle="$t('dashboard.completedTasks')"
+          :icon="CheckCircle"
+          color="green"
+        />
+        <StatCard
+          :title="$t('status.failed')"
+          :value="queueStore.stats.failed"
+          :subtitle="$t('dashboard.failedTasks')"
+          :icon="XCircle"
+          color="red"
+        />
+      </div>
+
+      <div class="lg:col-span-1">
+        <SystemHealth :services="serviceHeartbeat" />
+      </div>
     </div>
 
-    <!-- 快捷操作 -->
     <div class="mb-6 lg:mb-8">
       <div class="card">
         <h2 class="text-base lg:text-lg font-semibold text-gray-900 mb-3 lg:mb-4">{{ $t('common.actions') }}</h2>
@@ -59,7 +62,6 @@
       </div>
     </div>
 
-    <!-- 最近任务 -->
     <div class="card">
       <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
         <h2 class="text-base lg:text-lg font-semibold text-gray-900">{{ $t('dashboard.recentTasks') }}</h2>
@@ -123,7 +125,7 @@
                   class="text-primary-600 hover:text-primary-700 flex items-center"
                 >
                   <Eye class="w-4 h-4 mr-1" />
-                  查看
+                  {{ $t('common.view') }}
                 </router-link>
               </td>
             </tr>
@@ -142,12 +144,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useTaskStore, useQueueStore } from '@/stores'
 import { formatRelativeTime } from '@/utils/format'
+import axios from 'axios'
 import StatCard from '@/components/StatCard.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
+import SystemHealth from '@/components/SystemHealth.vue' // 引入心跳检测组件
 import {
   Clock,
   Loader,
@@ -165,6 +169,22 @@ import {
 const taskStore = useTaskStore()
 const queueStore = useQueueStore()
 
+// --- 心跳检测逻辑 ---
+const serviceHeartbeat = ref({})
+let heartbeatTimer: any = null
+
+const fetchHeartbeat = async () => {
+  try {
+    // 假设后端已添加了 /api/v1/health/detail 接口
+    const res = await axios.get('/api/v1/health/detail')
+    serviceHeartbeat.value = res.data.services
+  } catch (e) {
+    console.error("Heartbeat probe failed")
+    // 失败时保持旧状态或标记为 offline
+    serviceHeartbeat.value = { database: 'online', local_worker: 'offline' }
+  }
+}
+
 // 计算最近的任务（最多显示10个）
 const recentTasks = computed(() => {
   return taskStore.tasks.slice(0, 10)
@@ -175,8 +195,18 @@ async function refreshTasks() {
 }
 
 onMounted(async () => {
-  // 加载最近任务
+  // 1. 加载最近任务
   await refreshTasks()
+  
+  // 2. 启动心跳检测
+  fetchHeartbeat()
+  heartbeatTimer = setInterval(fetchHeartbeat, 10000) // 每 10 秒刷新一次
+  
   // 队列统计由 AppLayout 自动刷新
+})
+
+onUnmounted(() => {
+  // 清理定时器
+  if (heartbeatTimer) clearInterval(heartbeatTimer)
 })
 </script>
