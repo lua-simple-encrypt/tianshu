@@ -2,19 +2,20 @@
 # ============================================================================
 # MinerU Tianshu Backend Installer (CUDA 13.0 Edition)
 # Environment: WSL2 / Ubuntu 24.04 / Python 3.12
+# Updated: MinerU 2.7.6, PaddleX 3.4.1, PaddleOCR 3.4.0
 # ============================================================================
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
 echo "📦 Installing MinerU Tianshu Backend Dependencies..."
-echo "🚀 Target Environment: CUDA 13.0 | Torch 2.10 | Paddle 3.3"
+echo "🚀 Target Environment: CUDA 13.0 | Torch 2.10 | Paddle 3.3 | PaddleX 3.4"
 echo ""
 
 # Definition of versions
 TORCH_URL="https://download.pytorch.org/whl/cu130"
 PADDLE_URL="https://www.paddlepaddle.org.cn/packages/stable/cu130/"
 FLASH_ATTN_URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl"
-PIP_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+PIP_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
 
 # ============================================================================
 # Step 1: System Checks
@@ -66,7 +67,8 @@ echo "[Step 3/8] Installing Foundation (NumPy 1.26.4)..."
 echo "  > Locking NumPy to 1.26.4 to prevent Paddle/Torch conflicts..."
 
 pip install --upgrade pip setuptools wheel -i $PIP_MIRROR
-pip install "numpy==1.26.4" "opencv-python-headless>=4.10.0.84" \
+# Updated opencv to 4.11 to match requirements
+pip install "numpy==1.26.4" "opencv-python-headless>=4.11.0.86" \
     -i $PIP_MIRROR \
     --default-timeout=300
 
@@ -116,17 +118,23 @@ echo "✓ PaddlePaddle installed"
 # Step 7: MinerU & Core Apps (No Dependencies)
 # ============================================================================
 echo ""
-echo "[Step 7/8] Installing MinerU & Transformers..."
+echo "[Step 7/8] Installing MinerU, PaddleX & Transformers..."
 echo "  > Using --no-deps to protect Torch/NumPy versions..."
 
-# Install Core Apps without dependencies first
+# Updated list to include PaddleX 3.4.1, new MinerU deps, and specific doclayout version
 pip install "mineru[core]>=2.7.6" \
-    "transformers==4.57.6" \
-    "tokenizers>=0.22.0" \
-    "paddleocr>=2.7.3" \
-    "albumentations>=1.4.11" \
-    "albucore>=0.0.15" \
-    "doclayout-yolo>=0.0.2" \
+            "albumentations>=1.4.11" \
+            "albucore>=0.0.15" \
+            "transformers==4.57.6" \
+            "tokenizers>=0.22.0" \
+            "doclayout-yolo==0.0.4" \
+            "paddleocr>=3.4.0" \
+            "paddlex>=3.4.1" \
+            "pdftext>=0.6.3" \
+            "json-repair>=0.46.2" \
+            "magika>=0.6.2" \
+            "scikit-image>=0.25.0" \
+            "fast-langdetect>=0.2.3" \
     --no-deps \
     -i $PIP_MIRROR
 
@@ -142,8 +150,9 @@ echo "  > Cleaning requirements.txt to avoid conflicts..."
 # Ensure we are in the script's directory
 cd "$(dirname "$0")" || exit
 
-# Create a temporary requirements file excluding heavy frameworks
-sed '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d' requirements.txt > requirements.tmp.txt
+# Create a temporary requirements file excluding heavy frameworks AND new components
+# Added /paddlex/d, /doclayout/d, /scikit-image/d to the exclusion list
+sed '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d' requirements.txt > requirements.tmp.txt
 
 echo "  > Installing safe dependencies..."
 pip install -r requirements.tmp.txt \
@@ -218,7 +227,16 @@ try:
 except Exception as e:
     success = fail(f"Paddle: {e}")
 
-# 4. Flash Attention
+# 4. PaddleX & OCR Check
+try:
+    import paddleocr
+    ok(f"PaddleOCR: {paddleocr.__version__}")
+    import paddlex
+    ok(f"PaddleX: {paddlex.__version__}")
+except Exception as e:
+    success = fail(f"PaddleX/OCR Error: {e}")
+
+# 5. Flash Attention
 try:
     import flash_attn
     ok(f"FlashAttention: {flash_attn.__version__}")
@@ -227,12 +245,14 @@ except ImportError:
 except Exception as e:
     warn(f"FlashAttention Error: {e}")
 
-# 5. MinerU
+# 6. MinerU
 try:
     from magic_pdf.data.dataset import Dataset
-    ok("MinerU (magic-pdf): Ready")
-except ImportError:
-    fail("MinerU: magic-pdf module not found")
+    import doclayout_yolo
+    ok(f"MinerU Core: Ready")
+    ok(f"DocLayout-YOLO: {doclayout_yolo.__version__}")
+except ImportError as e:
+    fail(f"MinerU Error: {e}")
 except Exception as e:
     # MinerU often has config warnings, treat as warning unless import fails
     ok(f"MinerU: Importable ({str(e)[:50]}...)")
