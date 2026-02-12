@@ -1,7 +1,7 @@
 # ============================================================================
 # MinerU Server - Enterprise AI Data Preprocessing (CUDA 13.0 Edition)
 # Optimized for Aliyun Mirrors with Network Resilience
-# Updated for: MinerU >= 2.7.6, PaddleOCR >= 3.4.0, PaddleX >= 3.4.1
+# Updated: PaddleOCR[all] (Full Features), MinerU 2.7.6
 # ============================================================================
 
 # -----------------------------------------------------------------------------
@@ -61,8 +61,6 @@ COPY backend/requirements.txt /tmp/requirements.txt
 ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 
 # Step 1: [地基] 锁定 NumPy (1.26.4)
-# ⚠️ 警告：MinerU 2.7.6 依赖 scikit-image>=0.25.0，它可能想升级 numpy。
-# 必须在此处死锁 numpy<2.0.0，否则 Paddle 3.4.1 会崩溃。
 RUN --mount=type=cache,target=/root/.cache/pip \
     echo "=== Installing Foundation (NumPy 1.26.4) ===" && \
     pip install "numpy==1.26.4" "opencv-python-headless>=4.11.0.86" \
@@ -89,20 +87,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     -i https://www.paddlepaddle.org.cn/packages/stable/cu130/ \
     --break-system-packages
 
-# Step 5: [业务库] 安装 MinerU 2.7.6 & PaddleX (手动依赖管理)
-# 关键变更：
-# 1. 指定 doclayout-yolo==0.0.4 (pyproject.toml 要求)
-# 2. 补充 pdftext, json-repair, magika 等新依赖
-# 3. 仍然使用 --no-deps，因为 mineru[core] 会尝试安装 vllm，这会破坏 Torch 2.10
+# Step 5: [业务库] 安装 MinerU, PaddleX, PaddleOCR[all]
+# 关键变更:
+# 1. 升级为 paddleocr[all]>=3.4.0 (全功能版)
+# 2. 依然使用 --no-deps 保护 Torch/NumPy
 RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "=== Installing MinerU & PaddleX (No Deps) ===" && \
+    echo "=== Installing MinerU & Paddle Ecosystem (No Deps) ===" && \
     pip install "mineru[core]>=2.7.6" \
                 "albumentations>=1.4.11" \
                 "albucore>=0.0.15" \
                 "transformers==4.57.6" \
                 "tokenizers>=0.22.0" \
                 "doclayout-yolo==0.0.4" \
-                "paddleocr>=3.4.0" \
+                "paddleocr[all]>=3.4.0" \
                 "paddlex>=3.4.1" \
                 "pdftext>=0.6.3" \
                 "json-repair>=0.46.2" \
@@ -113,11 +110,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     -i ${PIP_MIRROR} \
     --break-system-packages
 
-# Step 6: [补全] 安装 requirements.txt 中的剩余依赖
-# 增加过滤列表，防止 requirements.txt 中的旧版本覆盖新安装的包
+# Step 6: [补全] 安装 requirements.txt
+# 过滤掉所有可能冲突的大型库，补齐小型依赖
 RUN --mount=type=cache,target=/root/.cache/pip \
     echo "=== Installing Remaining Requirements ===" && \
-    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d' /tmp/requirements.txt && \
+    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d; /paddleocr/d' /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt \
     -i ${PIP_MIRROR} \
     --break-system-packages
@@ -127,7 +124,7 @@ RUN python -c "import torch; print(f'✅ PyTorch: {torch.__version__}')" && \
     python -c "import paddle; print(f'✅ Paddle: {paddle.__version__}')" && \
     python -c "import paddleocr; print(f'✅ PaddleOCR: {paddleocr.__version__}')" && \
     python -c "import paddlex; print(f'✅ PaddleX: {paddlex.__version__}')" && \
-    python -c "import doclayout_yolo; print(f'✅ DocLayout-YOLO: {doclayout_yolo.__version__} (Target: 0.0.4)')"
+    python -c "import yaml; print(f'✅ PyYAML: {yaml.__version__}')"
 
 # -----------------------------------------------------------------------------
 # Stage 3: Application Runtime
