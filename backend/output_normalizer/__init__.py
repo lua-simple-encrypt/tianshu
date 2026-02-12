@@ -1,65 +1,76 @@
 """
-输出结果规范化模块
+天枢输出规范化模块 (Production Ready)
+功能：统一解析引擎输出，处理资产上传，生成 UI 友好型结果。
 
-统一不同解析引擎的输出格式，确保：
-1. Markdown 文件名统一为 result.md
-2. 图片目录统一为 images/
-3. 图片引用路径统一为 images/xxx.jpg
-4. JSON 文件名统一为 result.json
-5. 自动上传图片到 RustFS 对象存储并替换 URL
-
-支持的引擎：
-- MinerU (pipeline)
-- PaddleOCR-VL
-- SenseVoice
-- Video Processing
-- Format Engines (FASTA, GenBank, etc.)
+规范化标准：
+1. 核心文档：result.md
+2. 结构化数据：result.json
+3. 图片资产：images/ (本地) 或 RustFS URL (云端)
+4. 引用修正：自动纠正 Markdown 中的图片路径
 """
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from loguru import logger
 
 from .base_output_normalizer import BaseOutputNormalizer
 from .standard_output_normalizer import StandardOutputNormalizer
 from .paddleocr_output_normalizer import PaddleOCROutputNormalizer
 
-# 全局单例实例
-_standard_normalizer = StandardOutputNormalizer()
-_paddleocr_normalizer = PaddleOCROutputNormalizer()
+# 全局单例，避免重复初始化
+_normalizers = {
+    "standard": StandardOutputNormalizer(),
+    "paddleocr-vl": PaddleOCROutputNormalizer()
+}
 
-
-def normalize_output(output_dir: Path, handle_method="standard") -> Dict[str, Any]:
+def normalize_output(output_dir: Path, handle_method: str = "standard") -> Dict[str, Any]:
     """
-    便捷函数：规范化输出目录
+    高级规范化入口函数
 
-    根据指定的处理方法选择合适的规范化器：
-    - standard: 使用通用规范化 (StandardOutputNormalizer)
-    - paddleocr-vl: 使用 PaddleOCR-VL 专用规范化 (PaddleOCROutputNormalizer)
+    逻辑：
+    1. 如果 handle_method 为 "auto"，则根据目录结构智能判定。
+    2. 执行物理文件更名、目录迁移。
+    3. 如果开启了 RustFS，则触发图片上传并执行 Markdown 文本全局正则替换。
 
     Args:
-        output_dir: 输出目录路径
-        handle_method: 处理方法，默认为 "standard"。支持 "standard" 或 "paddleocr-vl"
-
-    Returns:
-        Dict[str, Any]: 规范化后的文件信息
+        output_dir: 解析结果存放的物理路径
+        handle_method: 指定处理器 ['standard', 'paddleocr-vl', 'auto']
     """
-    ## 兼容handle_method未设置的老模式(基于output_dir 是否包含page_* 目录判断是否为PaddleOCR-VL输出)
     output_dir = Path(output_dir)
-    is_paddle_ocr_output = list(output_dir.glob("page_*"))
-    if is_paddle_ocr_output:
-        logger.info("🤖 Detected PaddleOCR-VL output format")
-        handle_method = "paddleocr-vl"
-    ## 基于handle_method选择规范化器
-    if handle_method == "standard":
-        logger.info("🤖 Using standard output normalize method")
-        return _standard_normalizer.normalize(output_dir)
-    elif handle_method == "paddleocr-vl":
-        logger.info("🤖 Using PaddleOCR-VL output normalize method")
-        return _paddleocr_normalizer.normalize(output_dir)
-    else:
-        raise ValueError(f"Unknown output_normalize handle_method: {handle_method}")
+    if not output_dir.exists():
+        logger.error(f"❌ Normalize failed: Directory not found {output_dir}")
+        raise FileNotFoundError(f"Output directory {output_dir} does not exist.")
 
+    # --- 1. 智能格式判定 ---
+    # PaddleOCR-VL 的典型特征是生成 page_1, page_2... 这种子目录
+    is_paddle_pattern = any(output_dir.glob("page_*"))
+    
+    if handle_method == "auto" or handle_method == "standard":
+        if is_paddle_pattern:
+            logger.info("🤖 [Auto-Detect] Detected PaddleOCR-VL folder structure.")
+            handle_method = "paddleocr-vl"
+        else:
+            handle_method = "standard"
+
+    # --- 2. 选择规范化器 ---
+    normalizer = _normalizers.get(handle_method, _normalizers["standard"])
+    logger.info(f"🛠️  Normalizing output via [{handle_method}] strategy...")
+
+    try:
+        # 执行核心规范化逻辑（物理移动文件 -> 上传云端 -> 路径替换）
+        result = normalizer.normalize(output_dir)
+        
+        logger.success(f"✅ Normalization complete for {output_dir.name}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Normalization process failed: {e}")
+        # 如果规范化失败，返回原始路径至少保证任务不崩溃
+        return {
+            "result_path": str(output_dir),
+            "status": "partial_success",
+            "error": str(e)
+        }
 
 __all__ = [
     "BaseOutputNormalizer",
