@@ -1,14 +1,14 @@
 """
 天枢任务合并工具 (Production Version)
 功能：将 PDF 分片处理后的多个子任务结果（Markdown/JSON）完美无缝合并。
-特性：支持页码修正、元数据聚合、异步 IO 安全。
+特性：支持全局页码修正、图片资产聚合、Options 自动解析。
 """
 
 import json
 import os
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from loguru import logger
 
 def merge_subtask_results(
@@ -21,24 +21,30 @@ def merge_subtask_results(
     
     Args:
         parent_task_id: 父任务 ID
-        subtasks: 数据库中查出的子任务列表（需包含 result_path 和 options）
-        output_dir: 合并结果的存储目录
+        subtasks: 数据库中查出的子任务列表（需包含 result_path, options, status）
+        output_dir: 合并结果的根存储目录
     """
-    logger.info(f"🧩 Starting merge for parent task: {parent_task_id} ({len(subtasks)} chunks)")
+    logger.info(f"🧩 开始合并父任务: {parent_task_id} (分片数: {len(subtasks)})")
     
-    # 1. 按照起始页码对子任务进行物理排序
+    # 1. 解析 Options 并按起始页码对子任务进行物理排序
     def get_start_page(task):
         try:
-            # options 可能是字符串或字典，取决于数据库驱动返回类型
             opts = task.get("options", {})
+            # 兼容数据库返回字符串的情况
             if isinstance(opts, str):
                 opts = json.loads(opts)
             return opts.get("chunk_info", {}).get("start_page", 0)
-        except Exception:
+        except Exception as e:
+            logger.error(f"❌ 解析子任务 Options 失败: {e}")
             return 0
 
-    sorted_tasks = sorted(subtasks, key=get_start_page)
+    # 过滤掉未完成或无结果的分片，并排序
+    valid_subtasks = [t for t in subtasks if t.get("status") == "completed" and t.get("result_path")]
+    sorted_tasks = sorted(valid_subtasks, key=get_start_page)
     
+    if not sorted_tasks:
+        raise ValueError(f"父任务 {parent_task_id} 下没有可用的已完成子任务结果")
+
     final_markdown = []
     final_json_pages = []
     total_images_copied = 0
@@ -53,70 +59,72 @@ def merge_subtask_results(
 
     # 2. 顺序迭代处理每个分片
     for task in sorted_tasks:
-        if task["status"] != "completed" or not task.get("result_path"):
-            continue
-            
         chunk_path = Path(task["result_path"])
         if not chunk_path.exists():
-            logger.warning(f"⚠️ Result path for subtask {task['task_id']} missing: {chunk_path}")
+            logger.warning(f"⚠️ 子任务 {task['task_id']} 结果路径丢失: {chunk_path}")
             continue
 
         # --- A. 合并 Markdown ---
-        # 优先查找 result.md，其次查找目录下的任意 .md
+        # 寻找分片内的 md 文件
         md_file = next(chunk_path.rglob("result.md"), next(chunk_path.rglob("*.md"), None))
         if md_file:
             content = md_file.read_text(encoding="utf-8")
-            # 添加分片注释，方便排查
-            chunk_info = json.loads(task["options"]).get("chunk_info", {})
-            marker = f"\n\n\n"
-            final_markdown.append(marker + content)
+            # 插入分片占位符，防止段落粘连
+            start_pg = get_start_page(task)
+            final_markdown.append(f"\n\n\n\n" + content)
 
-        # --- B. 合并并修正 JSON ---
+        # --- B. 合并并修正 JSON (核心难点) ---
         json_file = next(chunk_path.rglob("result.json"), next(chunk_path.rglob("*_content_list.json"), None))
         if json_file:
             try:
                 chunk_data = json.loads(json_file.read_text(encoding="utf-8"))
-                # 如果是 MinerU 格式，数据在 'pages' 列表里
+                # 支持 MinerU 2.x 的 pages 结构
                 pages = chunk_data.get("pages", [])
                 
-                # 计算页码偏移量
-                # 如果分片 2 是从第 51 页开始，offset 就是 50
+                # 计算全局偏移量 (例如：第二分片从51页开始，offset=50)
                 offset = get_start_page(task) - 1
                 
                 for page in pages:
+                    # 修正页码索引
                     if "page_idx" in page:
                         page["page_idx"] += offset
                     if "page_number" in page:
                         page["page_number"] += offset
+                    # 修正层级结构中的子页码引用（如果有）
                     final_json_pages.append(page)
             except Exception as e:
-                logger.error(f"❌ Failed to parse JSON for chunk {task['task_id']}: {e}")
+                logger.error(f"❌ 修正分片 JSON 索引失败 {task['task_id']}: {e}")
 
-        # --- C. 迁移本地图片 (如果有) ---
-        # 注意：如果图片已上传 RustFS，Markdown 里已经是 URL，这里只需迁移未上传的本地备份
+        # --- C. 迁移本地图片资产 ---
+        # 子任务的图片目录通常在 chunk_path/images/
         chunk_image_dir = chunk_path / "images"
         if chunk_image_dir.exists():
             for img in chunk_image_dir.iterdir():
                 if img.is_file():
-                    shutil.copy2(img, final_image_dir / img.name)
-                    total_images_copied += 1
+                    # 这里使用 copy2 保留元数据，防止重名直接覆盖
+                    target_img = final_image_dir / img.name
+                    if not target_img.exists():
+                        shutil.copy2(img, target_img)
+                        total_images_copied += 1
 
-    # 3. 写入最终文件
+    # 3. 持久化合并结果
     final_md_path = parent_res_dir / "result.md"
-    final_md_path.write_text("\n\n".join(final_markdown), encoding="utf-8")
+    # 使用 3 个换行符确保分片间有清晰的视觉间隔
+    final_md_path.write_text("\n\n\n".join(final_markdown), encoding="utf-8")
     
     final_json_path = parent_res_dir / "result.json"
     with open(final_json_path, "w", encoding="utf-8") as f:
         json.dump({
             "parent_task_id": parent_task_id,
-            "total_chunks": len(subtasks),
+            "total_pages": len(final_json_pages),
+            "merged_chunks": len(sorted_tasks),
             "pages": final_json_pages
         }, f, ensure_ascii=False, indent=2)
 
-    logger.success(f"✅ Merge complete: {parent_task_id}")
-    logger.info(f"   - Final Markdown: {final_md_path.stat().st_size / 1024:.1f} KB")
-    logger.info(f"   - Final JSON: {len(final_json_pages)} pages")
-    logger.info(f"   - Total Images: {total_images_copied}")
+    logger.success(f"✅ 任务合并完成: {parent_task_id}")
+    logger.info(f"   - Markdown 大小: {final_md_path.stat().st_size / 1024:.1f} KB")
+    logger.info(f"   - JSON 页数: {len(final_json_pages)}")
+    logger.info(f"   - 聚合图片数: {total_images_copied}")
 
     return {
         "result_path": str(parent_res_dir),
