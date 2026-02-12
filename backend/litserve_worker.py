@@ -44,13 +44,13 @@ try:
 except Exception as e:
     logger.warning(f"MCP Patching bypassed: {e}")
 
-# 设置项目路径
+# 设置项目路径，确保能导入同级模块
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from task_db import TaskDB
 from output_normalizer import normalize_output
 from utils.merge_utils import merge_subtask_results # 导入合并工具
 
-# 引擎可用性检测
+# 引擎可用性深度检测
 def is_available(name): return importlib.util.find_spec(name) is not None
 PYPDF_AVAILABLE = is_available("pypdf")
 OPENAI_AVAILABLE = is_available("openai")
@@ -59,45 +59,46 @@ FITZ_AVAILABLE = is_available("fitz")
 class MinerUWorkerAPI(ls.LitAPI):
     def __init__(self, **kwargs):
         super().__init__()
+        # 路径与频率配置
         self.output_dir = kwargs.get("output_dir") or os.getenv("OUTPUT_PATH", "/app/data/output")
-        self.poll_interval = kwargs.get("poll_interval", 0.5)
+        self.poll_interval = float(os.getenv("WORKER_POLL_INTERVAL", 0.5))
         self.enable_worker_loop = kwargs.get("enable_worker_loop", True)
         
-        # 远程 API 集群配置
+        # 远程 API 集群配置 (适配 host.docker.internal 穿透宿主机)
         self.paddle_vlm_url = os.getenv("PADDLE_VLM_URL", "http://host.docker.internal:8118/v1")
         self.mineru_vlm_url = os.getenv("MINERU_VLM_URL", "http://host.docker.internal:8119/v1")
 
     def setup(self, device):
-        # 1. 物理 GPU 隔离 (实现逻辑：Physical ID -> Logical cuda:0)
+        # 1. 物理 GPU 进程隔离
         if "cuda:" in str(device):
             gpu_id = str(device).split(":")[-1]
             os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-            os.environ["MINERU_DEVICE_MODE"] = "cuda:0"
+            os.environ["MINERU_DEVICE_MODE"] = "cuda:0" # 映射为逻辑 0 号卡
             logger.info(f"🎯 [GPU Isolation] Worker bound to Physical GPU {gpu_id}")
 
-        # 2. 初始化 OpenAI 兼容客户端（对接远程 vLLM）
+        # 2. 初始化 OpenAI 兼容客户端（对接远程 8118/8119 vLLM）
         if OPENAI_AVAILABLE:
             from openai import OpenAI
             self.client_paddle = OpenAI(api_key="EMPTY", base_url=self.paddle_vlm_url)
             self.client_mineru = OpenAI(api_key="EMPTY", base_url=self.mineru_vlm_url)
         
-        # 3. 初始化持久化层
+        # 3. 初始化任务数据库
         self.task_db = TaskDB(os.getenv("DATABASE_PATH", "/app/data/db/mineru_tianshu.db"))
-        self.mineru_pipeline_engine = None # 延迟加载本地模型
+        self.mineru_pipeline_engine = None # 延迟加载本地模型，仅在 pipeline 模式触发时加载
         self.running = True
         self.device = device
 
         if self.enable_worker_loop:
             threading.Thread(target=self._worker_loop, daemon=True).start()
-        logger.success(f"🚀 Worker {device} Setup Complete")
+        logger.success(f"🚀 Worker {device} Setup Complete & Polling Started")
 
     def _worker_loop(self):
-        """Worker 主动拉取任务循环"""
+        """Worker 抢单循环"""
         while self.running:
             try:
                 task = self.task_db.get_next_task(worker_id=f"worker-{self.device}")
                 if task:
-                    logger.info(f"📥 Pull Task: {task['task_id']} (Backend: {task.get('backend')})")
+                    logger.info(f"📥 Pulled Task: {task['task_id']} | Backend: {task.get('backend')}")
                     self._process_task(task)
                 else:
                     time.sleep(self.poll_interval)
@@ -106,19 +107,21 @@ class MinerUWorkerAPI(ls.LitAPI):
                 time.sleep(2)
 
     def _process_task(self, task: dict):
-        """核心处理路由"""
+        """主处理路由"""
         task_id = task["task_id"]
         file_path = task["file_path"]
+        # 解析 options
         options = json.loads(task.get("options", "{}")) if isinstance(task.get("options"), str) else task.get("options", {})
         backend = task.get("backend", "pipeline").lower()
 
         try:
-            # 1. 检查是否需要触发分片逻辑
+            # 1. PDF 大文件自动拆分逻辑
             if Path(file_path).suffix.lower() == ".pdf" and not task.get("parent_task_id"):
                 if self._should_split_pdf(task_id, file_path, task, options):
-                    return # 任务已裂变为子任务，当前流程中止
+                    logger.info(f"✂️ Task {task_id} split into subtasks. Parent record suspended.")
+                    return # 任务已转化为父任务，当前 Worker 释放
 
-            # 2. 路由分发逻辑
+            # 2. 路由分发
             result = None
             if backend == "pipeline":
                 result = self._process_with_mineru(file_path, options)
@@ -129,37 +132,39 @@ class MinerUWorkerAPI(ls.LitAPI):
             elif "paddleocr-vl" in backend:
                 result = self._process_remote_vlm(file_path, options, engine_type="paddle")
             else:
-                logger.warning(f"⚠️ Unknown backend {backend}, routing to pipeline")
+                logger.warning(f"⚠️ Unknown backend {backend}, falling back to pipeline")
                 result = self._process_with_mineru(file_path, options)
 
-            # 3. 提交任务结果
+            # 3. 标记当前分片/任务完成
             self.task_db.update_task_status(task_id, "completed", result_path=result["result_path"])
             
-            # 4. 【核心】如果是子任务，检查并触发父级合并
+            # 4. 【核心】触发结果合并逻辑
             if task.get("parent_task_id"):
                 parent_id = self.task_db.on_child_task_completed(task_id)
                 if parent_id:
-                    logger.info(f"🧱 All subtasks done. Merging results for Parent: {parent_id}")
+                    logger.info(f"🧱 All subtasks completed. Merging results for Parent Task: {parent_id}")
                     subtasks = self.task_db.get_child_tasks(parent_id)
+                    # 调用合并工具拼接 Markdown 和 JSON
                     merge_subtask_results(parent_id, subtasks, Path(self.output_dir))
+                    # 更新父任务为完成状态，并指向合并后的目录
                     self.task_db.update_task_status(parent_id, "completed", 
                                                    result_path=str(Path(self.output_dir) / parent_id))
 
         except Exception as e:
             logger.error(f"❌ Task {task_id} Failed: {e}")
             self.task_db.update_task_status(task_id, "failed", error_message=str(e))
-            # 级联标记父任务失败
+            # 如果分片失败，通知父任务也标记为失败
             if task.get("parent_task_id"):
                 self.task_db.on_child_task_failed(task_id, str(e))
         finally:
             self._clean_memory()
 
     # ============================================================================
-    # 引擎实现
+    # 推理引擎核心实现
     # ============================================================================
 
     def _process_remote_vlm(self, file_path: str, options: dict, engine_type="mineru") -> dict:
-        """远程 VLM 集群调度逻辑"""
+        """远程 VLM 调用逻辑：渲染 PDF 页 -> Base64 传图 -> OpenAI API 响应"""
         import fitz
         doc = fitz.open(file_path)
         output_dir = Path(self.output_dir) / Path(file_path).stem
@@ -168,16 +173,17 @@ class MinerUWorkerAPI(ls.LitAPI):
         client = self.client_mineru if engine_type == "mineru" else self.client_paddle
         model_name = "mineru-vlm-1.2b" if engine_type == "mineru" else "PaddleOCR-VL-1.5"
         
+        # 提示词微调：强制要求 Markdown 结构
         system_prompt = (
-            "你是一个高精度的 OCR 专家。请将图片内容转换为符合 Markdown 规范的文本，"
-            "保留所有数学公式（使用 LaTeX）、表格（使用 Markdown 表格）和完整的排版层级。"
+            "你是一个专业的文档数字化专家。请将提供的图片内容转换为精准的 Markdown 格式。"
+            "必须保留所有数学公式（使用 LaTeX）、表格（使用 Markdown 标准表格）并还原标题层级。"
         )
 
         full_md = []
-        logger.info(f"🔮 [VLM] Forwarding {len(doc)} pages to {model_name}...")
+        logger.info(f"🔮 [VLM] Processing {len(doc)} pages via {model_name}...")
 
         for i in range(len(doc)):
-            # 渲染 144 DPI (2.0 zoom) 图片，保证 OCR 清晰度
+            # 高清渲染：2x 缩放确保 OCR 识别精度
             pix = doc[i].get_pixmap(matrix=fitz.Matrix(2, 2))
             img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
             
@@ -191,63 +197,68 @@ class MinerUWorkerAPI(ls.LitAPI):
                     ]
                 }],
                 max_tokens=2048,
-                temperature=0.05 # 接近确定性输出
+                temperature=0.05 # 降低随机性，保证公式输出稳定
             )
             full_md.append(f"\n{response.choices[0].message.content}")
 
-        final_content = "\n\n".join(full_md)
-        (output_dir / "result.md").write_text(final_content, encoding="utf-8")
+        final_md = "\n\n".join(full_md)
+        (output_dir / "result.md").write_text(final_md, encoding="utf-8")
+        
+        # 规范化输出目录
         normalize_output(output_dir)
         return {"result_path": str(output_dir)}
 
     def _process_hybrid(self, file_path: str, options: dict) -> dict:
-        """智能混合决策逻辑"""
+        """混合动力分流逻辑"""
         is_complex = False
         if PYPDF_AVAILABLE:
             from pypdf import PdfReader
-            text = PdfReader(file_path).pages[0].extract_text()
-            # 简单启发式：如果首页文字极少（<50字符），判定为扫描件/图表，走 VLM
-            if len(text.strip()) < 50: is_complex = True
+            try:
+                # 简单启发式：抽取首页文字，若字数极少（<50）判定为扫描件/图表，走 VLM
+                text = PdfReader(file_path).pages[0].extract_text()
+                if len(text.strip()) < 50: is_complex = True
+            except: is_complex = True # 无法读取文字，可能是图片 PDF
             
         if is_complex:
-            logger.info("⚖️ [Hybrid] Complex doc detected -> Routing to VLM.")
+            logger.info("⚖️ [Hybrid] Complex doc detected -> Routing to REMOTE VLM.")
             return self._process_remote_vlm(file_path, options, engine_type="mineru")
         else:
-            logger.info("⚖️ [Hybrid] Standard doc detected -> Routing to Local Pipeline.")
+            logger.info("⚖️ [Hybrid] Standard doc detected -> Routing to LOCAL Pipeline.")
             return self._process_with_mineru(file_path, options)
 
     def _should_split_pdf(self, task_id: str, file_path: str, task: dict, options: dict) -> bool:
-        """高性能分片逻辑"""
+        """高性能物理拆分逻辑"""
         if not PYPDF_AVAILABLE: return False
         from utils.pdf_utils import get_pdf_page_count, split_pdf_file
         
-        # 从环境变量读取配置 (默认 50 页拆分)
+        # 读取分片配置
         threshold = int(os.getenv("PDF_SPLIT_THRESHOLD_PAGES", "50"))
         chunk_size = int(os.getenv("PDF_SPLIT_CHUNK_SIZE", "20"))
         
-        pages = get_pdf_page_count(Path(file_path))
-        if pages <= threshold: return False
+        page_count = get_pdf_page_count(Path(file_path))
+        if page_count <= threshold: return False
 
-        logger.info(f"✂️ Splitting large PDF ({pages} pages) for Parallel processing...")
+        logger.info(f"✂️ Large PDF detected ({page_count} pages). Splitting for parallelism...")
         split_dir = Path(self.output_dir) / "temp_splits" / task_id
+        # 调用 pikepdf 进行零拷贝物理拆分
         chunks = split_pdf_file(Path(file_path), split_dir, chunk_size=chunk_size, parent_task_id=task_id)
 
+        # 在数据库中注册父子任务关系
         self.task_db.convert_to_parent_task(task_id, child_count=len(chunks))
         for chunk in chunks:
-            # 子任务继承父任务的所有配置
             self.task_db.create_child_task(
                 parent_task_id=task_id,
                 file_name=chunk["name"],
                 file_path=chunk["path"],
                 backend=task.get("backend", "pipeline"),
-                options={**options, "chunk_info": chunk},
+                options={**options, "chunk_info": chunk}, # 注入分片信息供合并使用
                 priority=task.get("priority", 0),
                 user_id=task.get("user_id")
             )
         return True
 
     def _process_with_mineru(self, file_path: str, options: dict) -> dict:
-        """本地 GPU 解析逻辑"""
+        """本地核心流水线"""
         if not self.mineru_pipeline_engine:
             from mineru_pipeline import MinerUPipelineEngine
             self.mineru_pipeline_engine = MinerUPipelineEngine(device="cuda:0")
@@ -259,20 +270,21 @@ class MinerUWorkerAPI(ls.LitAPI):
         return res
 
     def _clean_memory(self):
-        """显存防泄漏清理"""
+        """物理显存回收"""
         try:
             import torch
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             gc.collect()
         except: pass
 
-    # LitServe 接口实现
+    # LitServe 预测接口（主要用于外部心跳拨测）
     def decode_request(self, request): return request.get("action", "health")
-    def predict(self, action): return {"status": "healthy", "worker": self.device}
+    def predict(self, action): return {"status": "healthy", "worker": str(self.device)}
     def encode_response(self, response): return response
 
 # ============================================================================
-# 启动入口
+# 启动程序
 # ============================================================================
 def start_litserve_workers(**kwargs):
     api = MinerUWorkerAPI(**kwargs)
@@ -281,14 +293,12 @@ def start_litserve_workers(**kwargs):
         accelerator=kwargs.get("accelerator", "auto"),
         devices=kwargs.get("devices", "auto"),
         workers_per_device=kwargs.get("workers_per_device", 1),
-        timeout=False
+        timeout=False # 解析任务耗时较长，禁用 LitServe 超时
     )
     server.run(port=kwargs.get("port", 8001))
 
 if __name__ == "__main__":
     import argparse
-    from utils import parse_list_arg
-    
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--devices", type=str, default="auto")
