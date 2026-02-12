@@ -1,7 +1,7 @@
 # ============================================================================
 # MinerU Server - Enterprise AI Data Preprocessing (CUDA 13.0 Edition)
 # Optimized for: MinerU 2.7.6 (1.2B VLM Support)
-# Fixes: libglx-mesa0 (Ubuntu 24.04), missing boto3/pypdf/openai
+# Fixes: Missing botocore, s3transfer, reportlab, and other sub-dependencies
 # ============================================================================
 
 FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 AS base
@@ -19,8 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
     PIP_CACHE_DIR=/root/.cache/pip
 
-# 2. [系统修复] 安装底层库
-# 特别注意：Ubuntu 24.04 使用 libglx-mesa0 替代了已废弃的 libgl1-mesa-glx
+# 2. [系统修复] 安装底层库 (Ubuntu 24.04 适配)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-dev python3-pip python3.12-venv \
     git wget curl ffmpeg antiword pandoc poppler-utils \
@@ -28,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglx-mesa0 libgstreamer1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. [系统修复] 安装中文字体 (解决渲染文本丢失)
+# 3. [系统修复] 安装中文字体
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-core fonts-noto-cjk fonts-noto-cjk-extra \
     fonts-wqy-zenhei fonts-wqy-microhei fontconfig \
@@ -52,50 +51,54 @@ WORKDIR /tmp
 COPY backend/requirements.txt /tmp/requirements.txt
 ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 
-# Step 1: [地基] 锁定 NumPy 和 OpenCV
+# Step 1: [地基] 锁定科学计算基础包
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "numpy==1.26.4" "opencv-python-headless>=4.11.0.86" -i ${PIP_MIRROR} --break-system-packages
+    pip install "numpy==1.26.4" "pandas>=1.3.0" "psutil" "py-cpuinfo" -i ${PIP_MIRROR} --break-system-packages
 
 # Step 2: [框架A] PyTorch 2.10.0+cu130
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
 
-# Step 3: [扩展] FlashAttention (匹配 Torch 2.10)
+# Step 3: [扩展] FlashAttention
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl --break-system-packages
 
-# Step 4: [框架B] PaddlePaddle 3.3.0+cu130
+# Step 4: [框架B] PaddlePaddle 3.3.0
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/ --break-system-packages
 
-# Step 5: [业务库] 核心组件安装 (补全 openai, pypdf, boto3 以支持新后端)
+# Step 5: [核心业务包] (注意：移除 --no-deps，补全缺失的 botocore/reportlab 等)
+# 加入了日志中提示缺失的所有包
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "huggingface-hub<1.0" \
                 "mineru[core]>=2.7.6" \
                 "paddleocr[all]>=3.4.0" \
                 "paddlex>=3.4.1" \
                 "transformers==4.57.6" \
-                "tokenizers>=0.22.0" \
-                "doclayout-yolo==0.0.4" \
-                "pdftext>=0.6.3" \
-                "boto3>=1.34.0" \
-                "pypdf>=5.1.0" \
                 "openai>=1.50.0" \
-                "json-repair>=0.46.2" \
-                "magika>=0.6.2" \
-                "fast-langdetect>=0.2.3" \
+                "boto3>=1.34.0" \
+                "botocore>=1.34.0" \
+                "pypdf>=5.1.0" \
+                "reportlab" \
+                "pdfminer.six>=20251230" \
+                "albumentations>=1.4.11" \
+                "opencv-python>=4.11.0.86" \
                 "scikit-image>=0.25.0" \
-                "shapely>=2.0.0" \
-                "pyclipper>=1.3.0" \
-    --no-deps -i ${PIP_MIRROR} --break-system-packages
+                "mineru-vl-utils" \
+                "qwen-vl-utils" \
+                "doclayout-yolo==0.0.4" \
+                "prettytable" \
+                "ruamel.yaml" \
+                "ujson" \
+    -i ${PIP_MIRROR} --break-system-packages
 
-# Step 6: [补全] 安装 requirements.txt (增加 openai 过滤防止冲突)
+# Step 6: [补全] 安装 requirements.txt 并过滤掉已安装的重型框架
 RUN --mount=type=cache,target=/root/.cache/pip \
-    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d; /paddleocr/d; /huggingface/d; /boto3/d; /pypdf/d; /openai/d' /tmp/requirements.txt && \
+    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /pandas/d; /transformers/d; /mineru/d; /paddlex/d; /boto3/d; /openai/d; /pypdf/d' /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt -i ${PIP_MIRROR} --break-system-packages
 
-# Step 7: [最终验证] 
-RUN python -c "import torch; import pypdf; import boto3; import openai; print('✅ All Backend Dependencies Verified')" && \
+# Step 7: [最终验证]
+RUN python -c "import torch; import pypdf; import boto3; import botocore; import openai; print('✅ All Backend Dependencies Verified')" && \
     pip show paddlepaddle-gpu paddleocr paddlex mineru | grep Version
 
 # -----------------------------------------------------------------------------
@@ -114,9 +117,6 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/init-models.sh &
 WORKDIR /app/backend
 
 EXPOSE 8000 8001 8002
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["api", "python", "api_server.py"]
