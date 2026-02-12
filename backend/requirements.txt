@@ -1,28 +1,37 @@
 # ============================================================================
 # MinerU-Server Backend Requirements (Final Production Version)
 # ============================================================================
-# ⚠️ 提示：核心框架 (Torch, Paddle, FlashAttn) 已在 Dockerfile 中锁定安装。
-# 本文件用于补全业务逻辑、对象存储及 PDF 处理所需的依赖包。
-# ============================================================================
 
-# 1. 基础科学计算 (严格锁定版本，防止破坏框架环境)
+# 1. 基础科学计算与底层支撑 (补全日志中缺失的 pandas/psutil 等)
 numpy==1.26.4
+pandas>=1.3.0
 opencv-python-headless>=4.11.0.86
 shapely>=2.0.0
 pyclipper>=1.3.0
-PyYAML>=6.0.3
+# [关键修复] 日志提示 paddlex 3.4.1 强依赖 PyYAML 6.0.2
+PyYAML==6.0.2
+psutil
+py-cpuinfo
+seaborn>=0.11.0
+thop>=0.1.1
 
 # 2. MinerU 2.7.6 & 1.2B VLM 必需依赖
-# [关键补全] 解决日志中的 ModuleNotFoundError
+# [关键修复] 补全日志缺失的 botocore, reportlab, pdfminer
 boto3>=1.34.0
+botocore>=1.34.0
 pypdf>=5.1.0
 json-repair>=0.46.2
-fast-langdetect>=0.2.3
+# [关键修复] 日志提示 mineru 2.7.6 强依赖 fast-langdetect < 0.3.0
+fast-langdetect>=0.2.3,<0.3.0
 magika>=0.6.2
 pdftext>=0.6.3
 beautifulsoup4>=4.14.0
 scikit-image>=0.25.0
 albumentations>=1.4.11
+reportlab
+pdfminer.six>=20251230
+mineru-vl-utils>=0.1.19.1
+qwen-vl-utils<1,>=0.0.14
 
 # 3. Web 服务与 API 架构
 fastapi==0.115.6
@@ -31,7 +40,7 @@ python-multipart>=0.0.20
 litserve==0.2.16
 aiohttp==3.11.11
 
-# 4. 存储与工具库
+# 4. 存储与工具库 (补全 paddlex 缺失的 prettytable/ujson)
 click>=8.1.7
 requests>=2.32.5
 loguru>=0.7.3
@@ -39,43 +48,42 @@ python-dotenv>=1.0.1
 minio>=7.2.0
 redis>=5.0.0
 markitdown>=0.1.4
-attrdict>=2.0.1  # Paddle 内部组件常用
+attrdict>=2.0.1
+prettytable
+ujson
+chardet
+ruamel.yaml
+aistudio-sdk>=0.3.5
 
-# 5. 模型管理 (与 Transformers 4.57.6 保持兼容)
+# 5. 模型管理与 OpenAI 兼容
 modelscope>=1.34.0
 huggingface-hub>=0.28.0,<1.0.0
+openai>=1.50.0
 
-# 6. 安全与认证
+# 6. 安全、认证与协议
 pyjwt>=2.10.0
 pydantic==2.10.5
 pydantic-core==2.27.2
 email-validator>=2.2.0
-
-# 7. MCP (Model Context Protocol) 协议支持
 mcp==1.1.2
 sse-starlette==2.2.1
 jsonschema>=4.23.0
 jsonschema-specifications>=2024.10.0
 
-# 8. Python 3.12 兼容性补丁
+# 7. Python 兼容性与格式处理
 setuptools>=75.0.0
 packaging>=24.0
 typing-extensions>=4.12.0
 lxml>=6.0.0
 regex>=2026.1.15
-
-# 9. 音视频处理
-funasr>=1.3.0
-ffmpeg-python>=0.2.0
-soundfile>=0.13.0
-
-# 10. 图像与 PDF 处理增强
 PyMuPDF>=1.25.0
 Pillow>=11.0.0
 img2pdf>=0.6.0
 pikepdf>=10.0.0
 matplotlib>=3.10.0
-contourpy>=1.3.0
-kiwisolver>=1.4.7
 ftfy>=6.3.0
-openai>=1.50.0
+
+# 8. 音视频解析
+funasr>=1.3.0
+ffmpeg-python>=0.2.0
+soundfile>=0.13.0
