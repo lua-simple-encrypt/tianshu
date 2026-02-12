@@ -1,460 +1,311 @@
 #!/usr/bin/env python3
 """
-模型预下载脚本 - 为 CPU 离线部署准备所有必需模型
+Tianshu Model Downloader - Offline Preparation Script
+=====================================================
+Downloads all required models for MinerU, PaddleOCR, PaddleX, and SenseVoice
+to prepare for offline/air-gapped deployment.
 
-功能:
-1. 下载 MinerU 模型到指定目录
-2. 触发 PaddleOCR 模型自动下载
-3. 下载 SenseVoice 音频识别模型
-4. 下载 Paraformer 说话人分离模型
-5. 下载 YOLO11 水印检测模型
-6. 下载 LaMa 水印修复模型
-7. 模型验证和完整性检查
-8. 生成模型清单 manifest.json
-
-用法:
-    python download_models.py --output ./models-offline
-    python download_models.py --output ./models-offline --models mineru,sensevoice
+Usage:
+    python download_models.py --output ./models
+    python download_models.py --output ./models --models mineru,paddlex
 """
 
 import os
 import sys
 import json
 import argparse
+import shutil
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-# 配置日志
+# Configure Logging
 logger.remove()
 logger.add(sys.stdout, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
 
-# 模型配置
+# ==============================================================================
+# Model Configurations
+# ==============================================================================
 MODELS = {
+    # 1. MinerU / PDF-Extract-Kit
     "mineru": {
-        "name": "MinerU PDF-Extract-Kit",
+        "name": "MinerU PDF-Extract-Kit 1.0",
         "repo_id": "opendatalab/PDF-Extract-Kit-1.0",
         "source": "huggingface",
-        "target_dir": "huggingface/hub/",
-        "description": "PDF OCR and layout analysis models",
+        "target_dir": "mineru_cache/models",  # Maps to /root/.cache/mineru
+        "description": "Core PDF extraction models (Layout, Formula, Reading Order)",
         "required": True
     },
-    "paddleocr": {
-        "name": "PaddleOCR Multi-language Models",
-        "auto_download": True,
-        "target_dir": ".paddleocr/models/",
-        "description": "Will be downloaded automatically on first run (~2GB)",
-        "required": False
+    
+    # 2. DocLayout-YOLO (Required by MinerU 2.7.6)
+    "doclayout": {
+        "name": "DocLayout-YOLO",
+        "repo_id": "opendatalab/DocLayout-YOLO",
+        "source": "huggingface",
+        "target_dir": "mineru_cache/models/DocLayout-YOLO",
+        "description": "Advanced layout detection for MinerU",
+        "required": True
     },
+
+    # 3. PaddleOCR / PaddleX Official Models
+    # Note: PaddleX downloads models on-the-fly, but we pre-download the core set
+    "paddlex_ocr": {
+        "name": "PaddleOCR v4 Server Models",
+        "urls": [
+            "https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_det_server_infer.tar",
+            "https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_server_infer.tar",
+            "https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar"
+        ],
+        "source": "direct",
+        "target_dir": "paddlex_cache/official_models", # Maps to /root/.paddlex/official_models
+        "description": "High-accuracy OCR models for server deployment",
+        "required": True
+    },
+
+    # 4. SenseVoice (Speech-to-Text)
     "sensevoice": {
-        "name": "SenseVoice Audio Recognition",
+        "name": "SenseVoice Small",
         "model_id": "iic/SenseVoiceSmall",
         "source": "modelscope",
-        "target_dir": "sensevoice/",
-        "description": "Multi-language speech recognition model",
+        "target_dir": "modelscope_cache/sensevoice",
+        "description": "Multi-language high-speed speech recognition",
         "required": True
     },
+
+    # 5. Paraformer (Speaker Diarization)
     "paraformer": {
-        "name": "Paraformer Speaker Diarization",
+        "name": "Paraformer Large (Speaker Diarization)",
         "model_id": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
         "source": "modelscope",
-        "target_dir": "paraformer/",
-        "description": "Speaker diarization and VAD model",
+        "target_dir": "modelscope_cache/paraformer",
+        "description": "Speaker verification and diarization",
         "required": False
     },
+
+    # 6. YOLO11 (Watermark Detection)
     "yolo11": {
         "name": "YOLO11x Watermark Detection",
         "repo_id": "corzent/yolo11x_watermark_detection",
         "filename": "best.pt",
         "source": "huggingface",
-        "target_dir": "watermark_models/",
-        "description": "Watermark detection model for document processing",
+        "target_dir": "watermark_models",
+        "description": "Custom YOLO model for detecting watermarks",
         "required": False
     },
+    
+    # 7. LaMa (Inpainting) - usually handled by simple-lama-inpainting, 
+    # but we download it here to be safe for offline use.
     "lama": {
-        "name": "LaMa Watermark Inpainting",
-        "auto_download": True,
-        "description": "Will be downloaded by simple_lama_inpainting on first use",
+        "name": "Big LaMa Inpainting",
+        "urls": [
+            "https://github.com/advimman/lama/releases/download/resolutions/big-lama.zip"
+        ],
+        "source": "direct",
+        "target_dir": "cache/torch/hub/checkpoints", # Standard torch hub location
+        "description": "Image inpainting model for watermark removal",
         "required": False
     }
 }
 
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+def download_file_direct(url, target_dir):
+    """Download file from direct URL"""
+    import requests
+    import tarfile
+    import zipfile
+    
+    filename = url.split("/")[-1]
+    save_path = Path(target_dir) / filename
+    
+    if save_path.exists():
+        logger.info(f"    ℹ️  File exists: {filename}")
+        return save_path
+
+    logger.info(f"    ⬇️  Downloading: {url}")
+    try:
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(save_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        
+        # Extract if tar/zip
+        if filename.endswith(".tar"):
+            logger.info(f"    📦 Extracting tar: {filename}")
+            with tarfile.open(save_path) as tar:
+                tar.extractall(path=target_dir)
+        elif filename.endswith(".zip"):
+            logger.info(f"    📦 Extracting zip: {filename}")
+            with zipfile.open(save_path, 'r') as zip_ref:
+                zip_ref.extractall(target_dir)
+                
+        return save_path
+    except Exception as e:
+        logger.error(f"    ❌ Download failed: {e}")
+        return None
 
 def download_from_huggingface(repo_id, target_dir, filename=None):
-    """从 HuggingFace 下载模型"""
+    """Download from HuggingFace Hub"""
     try:
         from huggingface_hub import snapshot_download, hf_hub_download
 
-        # 配置镜像（国内加速）
+        # Use HF Mirror for China
         hf_endpoint = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
         os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
 
         if filename:
-            # 下载单个文件
-            logger.info(f"   Downloading file: {filename}")
+            logger.info(f"    ⬇️  Downloading file: {filename}")
             path = hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
-                cache_dir=str(target_dir),
+                local_dir=str(target_dir),
+                local_dir_use_symlinks=False, # Important for offline copy
                 resume_download=True
             )
         else:
-            # 下载整个仓库
-            logger.info(f"   Downloading repository: {repo_id}")
+            logger.info(f"    ⬇️  Downloading repo: {repo_id}")
             path = snapshot_download(
                 repo_id=repo_id,
-                cache_dir=str(target_dir),
-                resume_download=True
+                local_dir=str(target_dir),
+                local_dir_use_symlinks=False, # Important for offline copy
+                resume_download=True,
+                ignore_patterns=["*.git*", "*.md"] # Skip git files
             )
-
         return path
-
     except ImportError:
-        logger.error("   ❌ huggingface_hub not installed. Install: pip install huggingface-hub")
+        logger.error("    ❌ huggingface_hub not installed. Run: pip install huggingface-hub")
         return None
     except Exception as e:
-        logger.error(f"   ❌ Download failed: {e}")
+        logger.error(f"    ❌ HuggingFace download failed: {e}")
         return None
-
 
 def download_from_modelscope(model_id, target_dir):
-    """从 ModelScope 下载模型"""
+    """Download from ModelScope"""
     try:
         from modelscope import snapshot_download
-
-        logger.info(f"   Downloading from ModelScope: {model_id}")
+        logger.info(f"    ⬇️  Downloading from ModelScope: {model_id}")
         path = snapshot_download(
             model_id,
-            cache_dir=str(target_dir),
+            cache_dir=str(Path(target_dir).parent), # Modelscope creates its own subdir
             revision="master"
         )
-
         return path
-
     except ImportError:
-        logger.error("   ❌ modelscope not installed. Install: pip install modelscope")
+        logger.error("    ❌ modelscope not installed. Run: pip install modelscope")
         return None
     except Exception as e:
-        logger.error(f"   ❌ Download failed: {e}")
+        logger.error(f"    ❌ ModelScope download failed: {e}")
         return None
 
+def get_dir_size(path):
+    """Calculate directory size in MB"""
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file():
+                total += entry.stat().st_size
+            elif entry.is_dir():
+                total += get_dir_size(entry.path) * 1024 * 1024 # Recursive returns MB
+    except Exception:
+        pass
+    return total / (1024 * 1024)
 
-def verify_model_files(path, model_name):
-    """验证模型文件完整性"""
-    if not path or not Path(path).exists():
-        return False
+# ==============================================================================
+# Main Execution
+# ==============================================================================
+def main(output_dir, selected=None, force=False):
+    logger.info("="*60)
+    logger.info("🚀 Tianshu Offline Model Downloader")
+    logger.info("="*60)
+    
+    root_path = Path(output_dir).resolve()
+    root_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"📂 Output Directory: {root_path}")
 
-    path_obj = Path(path)
-
-    # 检查关键文件（根据不同模型类型）
-    if model_name == "mineru":
-        # MinerU 应该包含 .safetensors 或 .bin 文件
-        has_model = any(path_obj.rglob("*.safetensors")) or any(path_obj.rglob("*.bin"))
-        if not has_model:
-            logger.warning(f"   ⚠️  No model files (.safetensors/.bin) found in {path}")
-            return False
-
-    elif model_name in ["sensevoice", "paraformer"]:
-        # ModelScope 模型应该包含配置文件
-        config_file = path_obj / "configuration.json"
-        if not config_file.exists():
-            # 尝试查找其他配置文件
-            config_file = path_obj / "config.json"
-        if not config_file.exists():
-            logger.warning(f"   ⚠️  No configuration file found in {path}")
-            return False
-
-    elif model_name == "yolo11":
-        # YOLO 模型应该是 .pt 文件
-        if not str(path).endswith(".pt"):
-            logger.warning(f"   ⚠️  Invalid YOLO model file: {path}")
-            return False
-
-    logger.info(f"   ✅ Model files verified")
-    return True
-
-
-def get_directory_size(path):
-    """获取目录大小（MB）"""
-    if not path or not Path(path).exists():
-        return 0
-
-    path_obj = Path(path)
-    if path_obj.is_file():
-        return path_obj.stat().st_size / (1024 * 1024)
-
-    total_size = 0
-    for file_path in path_obj.rglob("*"):
-        if file_path.is_file():
-            total_size += file_path.stat().st_size
-
-    return total_size / (1024 * 1024)
-
-
-def check_model_exists(output_path, config, name):
-    """检查模型是否已存在
-
-    Args:
-        output_path: 输出目录路径
-        config: 模型配置字典
-        name: 模型名称
-
-    Returns:
-        tuple: (exists: bool, reason: str) 是否存在及原因说明
-    """
-    target_dir = output_path / config["target_dir"]
-
-    if not target_dir.exists():
-        return False, "Directory not found"
-
-    # 根据不同模型类型检查关键文件
-    if name == "mineru":
-        # 检查 HuggingFace hub 缓存
-        has_model = any(target_dir.rglob("*.safetensors")) or any(target_dir.rglob("*.bin"))
-        return has_model, "Model files found" if has_model else "Model files missing"
-
-    elif name in ["sensevoice", "paraformer"]:
-        # 检查 ModelScope 模型配置文件
-        config_files = list(target_dir.rglob("configuration.json"))
-        if not config_files:
-            config_files = list(target_dir.rglob("config.json"))
-        return bool(config_files), "Config found" if config_files else "Config missing"
-
-    elif name == "yolo11":
-        # 检查 YOLO .pt 文件
-        pt_files = list(target_dir.rglob("*.pt"))
-        return bool(pt_files), f"{len(pt_files)} .pt files found" if pt_files else "No .pt files"
-
-    # 对于未知类型，检查目录是否非空
-    if any(target_dir.iterdir()):
-        return True, "Files found"
-
-    return False, "Directory empty"
-
-
-def main(output_dir, selected_models=None, force=False):
-    """主函数
-
-    Args:
-        output_dir: 输出目录
-        selected_models: 选择的模型列表（逗号分隔），None 表示全部
-        force: 是否强制重新下载已存在的模型
-    """
-    logger.info("=" * 60)
-    logger.info("🚀 Tianshu Model Download Script")
-    logger.info("=" * 60)
-
-    output_path = Path(output_dir).resolve()
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"📁 Output directory: {output_path}")
-    if force:
-        logger.info("⚠️  Force mode: Will re-download existing models")
-    logger.info("")
-
-    # 筛选要下载的模型
-    models_to_download = MODELS
-    if selected_models:
-        selected_list = [m.strip() for m in selected_models.split(",")]
-        models_to_download = {k: v for k, v in MODELS.items() if k in selected_list}
-        logger.info(f"📋 Selected models: {', '.join(models_to_download.keys())}")
+    # Filter models
+    targets = MODELS
+    if selected:
+        keys = [s.strip() for s in selected.split(",")]
+        targets = {k: v for k, v in MODELS.items() if k in keys}
+        logger.info(f"📋 Selected: {', '.join(targets.keys())}")
     else:
-        logger.info(f"📋 Downloading all models ({len(MODELS)} total)")
+        logger.info(f"📋 Downloading ALL {len(targets)} models")
 
     logger.info("")
+    
+    stats = {"success": 0, "failed": 0, "skipped": 0}
+    
+    for key, config in targets.items():
+        logger.info(f"📦 [{key.upper()}] {config['name']}")
+        dest_dir = root_path / config['target_dir']
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check existing
+        if not force and any(dest_dir.iterdir()):
+            logger.info(f"    ✅ Found existing files in {dest_dir.name}")
+            stats["skipped"] += 1
+            logger.info("")
+            continue
 
-    manifest = {
-        "created": datetime.now().isoformat(),
-        "platform": "cpu",
-        "output_dir": str(output_path),
-        "models": {},
-        "total_size_mb": 0
-    }
-
-    total_downloaded = 0
-    total_skipped = 0
-    total_failed = 0
-
-    # 下载每个模型
-    for name, config in models_to_download.items():
-        logger.info(f"📦 [{name.upper()}] {config['name']}")
-        logger.info(f"   {config['description']}")
-
+        success = False
         try:
-            # 检查是否是自动下载的模型
-            if config.get("auto_download"):
-                logger.info(f"   ℹ️  {name} will be downloaded automatically on first run")
-                manifest["models"][name] = {
-                    "name": config["name"],
-                    "status": "auto_download",
-                    "description": config["description"]
-                }
-                logger.info("")
-                continue
-
-            # 创建目标目录
-            target = output_path / config["target_dir"]
-            target.mkdir(parents=True, exist_ok=True)
-
-            # 检查模型是否已存在（除非使用 --force）
-            if not force:
-                exists, reason = check_model_exists(output_path, config, name)
-                if exists:
-                    size_mb = get_directory_size(target)
-                    logger.info(f"   ✅ Already exists ({size_mb:.1f} MB)")
-                    logger.info(f"   📂 Path: {target}")
-                    manifest["models"][name] = {
-                        "name": config["name"],
-                        "status": "already_exists",
-                        "size_mb": round(size_mb, 2),
-                        "path": str(target),
-                        "description": config["description"]
-                    }
-                    manifest["total_size_mb"] += size_mb
-                    total_skipped += 1
-                    logger.info("")
-                    continue
-                else:
-                    logger.info(f"   ℹ️  Not found: {reason}")
-
-            # 下载模型
-            logger.info(f"   ⬇️  Downloading...")
-            path = None
-            if config["source"] == "huggingface":
-                path = download_from_huggingface(
-                    config["repo_id"],
-                    str(target),
-                    config.get("filename")
+            if config['source'] == 'huggingface':
+                res = download_from_huggingface(
+                    config['repo_id'], 
+                    dest_dir, 
+                    config.get('filename')
                 )
-            elif config["source"] == "modelscope":
-                path = download_from_modelscope(config["model_id"], str(target))
-
-            if path:
-                # 验证下载
-                if verify_model_files(path, name):
-                    size_mb = get_directory_size(path)
-                    manifest["models"][name] = {
-                        "name": config["name"],
-                        "status": "downloaded",
-                        "path": str(path),
-                        "size_mb": round(size_mb, 2),
-                        "description": config["description"]
-                    }
-                    manifest["total_size_mb"] += size_mb
-                    logger.info(f"   ✅ Downloaded successfully ({size_mb:.1f} MB)")
-                    logger.info(f"   📂 Path: {path}")
-                    total_downloaded += 1
-                else:
-                    manifest["models"][name] = {
-                        "name": config["name"],
-                        "status": "verification_failed",
-                        "path": str(path) if path else None,
-                        "description": config["description"]
-                    }
-                    total_failed += 1
+                success = bool(res)
+            
+            elif config['source'] == 'modelscope':
+                # ModelScope manages its own cache dir structure slightly differently
+                # We point it to the parent of the target dir usually
+                res = download_from_modelscope(config['model_id'], dest_dir)
+                success = bool(res)
+            
+            elif config['source'] == 'direct':
+                for url in config['urls']:
+                    res = download_file_direct(url, dest_dir)
+                    if res: success = True
+            
+            if success:
+                stats["success"] += 1
+                logger.info(f"    ✅ Download complete")
             else:
-                manifest["models"][name] = {
-                    "name": config["name"],
-                    "status": "download_failed",
-                    "error": "Download failed",
-                    "description": config["description"]
-                }
-                total_failed += 1
-
+                stats["failed"] += 1
+                
         except Exception as e:
-            logger.error(f"   ❌ Error downloading {name}: {e}")
-            manifest["models"][name] = {
-                "name": config["name"],
-                "status": "error",
-                "error": str(e),
-                "description": config["description"]
-            }
-            total_failed += 1
-
+            logger.error(f"    ❌ Critical error: {e}")
+            stats["failed"] += 1
+            
         logger.info("")
 
-    # 保存清单
-    manifest_file = output_path / "manifest.json"
-    with open(manifest_file, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-    # 输出总结
-    logger.info("=" * 60)
-    logger.info("📊 Download Summary")
-    logger.info("=" * 60)
-    logger.info(f"✅ Successfully downloaded: {total_downloaded} models")
-    if total_skipped > 0:
-        logger.info(f"⏭️  Skipped (already exists): {total_skipped} models")
-    logger.info(f"❌ Failed: {total_failed} models")
-    logger.info(f"💾 Total size: {manifest['total_size_mb']:.1f} MB")
-    logger.info(f"📄 Manifest saved to: {manifest_file}")
-    logger.info("")
-
-    if total_failed > 0:
-        logger.warning("⚠️  Some models failed to download. Please check the errors above.")
-        logger.info("   You can re-run this script to retry failed downloads.")
-        return 1
-
-    if total_downloaded > 0:
-        logger.info("🎉 All models downloaded successfully!")
-    else:
-        logger.info("✨ All models are already up to date!")
-
-    logger.info("")
-    logger.info("📋 Next steps:")
-    logger.info("   1. Package models: tar czf models-offline.tar.gz models-offline/")
-    logger.info("   2. Transfer to production server")
-    logger.info("   3. Run deployment script: ./deploy-cpu-offline.sh or ./deploy-gpu-offline.sh")
-    logger.info("")
-
-    return 0
-
+    # Summary
+    logger.info("="*60)
+    logger.info(f"📊 Summary: {stats['success']} downloaded, {stats['skipped']} skipped, {stats['failed']} failed")
+    logger.info(f"💾 Models are ready at: {root_path}")
+    logger.info("="*60)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Download all models for Tianshu CPU offline deployment",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Download all models
-  python download_models.py --output ./models-offline
-
-  # Download specific models only
-  python download_models.py --output ./models-offline --models mineru,sensevoice
-
-  # Force re-download all models (even if they exist)
-  python download_models.py --output ./models-offline --force
-
-  # Use custom HuggingFace mirror
-  HF_ENDPOINT=https://hf-mirror.com python download_models.py --output ./models-offline
-        """
-    )
-    parser.add_argument(
-        "--output",
-        default="./models-offline",
-        help="Output directory for downloaded models (default: ./models-offline)"
-    )
-    parser.add_argument(
-        "--models",
-        help="Comma-separated list of models to download (default: all). Available: "
-             + ", ".join(MODELS.keys())
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force re-download all models, even if they already exist"
-    )
-
+    parser = argparse.ArgumentParser(description="Tianshu Model Downloader")
+    parser.add_argument("--output", default="./models", help="Target directory (default: ./models)")
+    parser.add_argument("--models", help="Specific models to download (e.g., mineru,sensevoice)")
+    parser.add_argument("--force", action="store_true", help="Force re-download")
+    
     args = parser.parse_args()
-
+    
+    # Ensure dependencies
     try:
-        exit_code = main(args.output, args.models, args.force)
-        sys.exit(exit_code)
-    except KeyboardInterrupt:
-        logger.warning("\n⚠️  Download interrupted by user")
-        sys.exit(130)
-    except Exception as e:
-        logger.error(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
+        import huggingface_hub
+        import modelscope
+        import requests
+        import loguru
+    except ImportError as e:
+        print(f"❌ Missing dependency: {e.name}")
+        print("Run: pip install huggingface-hub modelscope requests loguru")
         sys.exit(1)
+
+    main(args.output, args.models, args.force)
