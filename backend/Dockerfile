@@ -1,7 +1,7 @@
 # ============================================================================
 # MinerU Server - Enterprise AI Data Preprocessing (CUDA 13.0 Edition)
 # Optimized for: MinerU 2.7.6 (1.2B VLM Support)
-# Updated: Fix boto3, pypdf missing & transformers conflict
+# Fixes: libglx-mesa0 (Ubuntu 24.04), missing boto3/pypdf/openai
 # ============================================================================
 
 FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 AS base
@@ -20,11 +20,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_CACHE_DIR=/root/.cache/pip
 
 # 2. [系统修复] 安装底层库
+# 特别注意：Ubuntu 24.04 使用 libglx-mesa0 替代了已废弃的 libgl1-mesa-glx
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-dev python3-pip python3.12-venv \
     git wget curl ffmpeg antiword pandoc poppler-utils \
     libgomp1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
-    libgl1 libgl1-mesa-glx libgstreamer1.0-0 \
+    libgl1 libglx-mesa0 libgstreamer1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. [系统修复] 安装中文字体 (解决渲染文本丢失)
@@ -67,8 +68,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/ --break-system-packages
 
-# Step 5: [业务库] 核心组件安装 (解决 boto3, pypdf, huggingface-hub 冲突)
-# 这里强制补全了 MinerU 2.7.6 所有的“软依赖”
+# Step 5: [业务库] 核心组件安装 (补全 openai, pypdf, boto3 以支持新后端)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "huggingface-hub<1.0" \
                 "mineru[core]>=2.7.6" \
@@ -80,6 +80,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                 "pdftext>=0.6.3" \
                 "boto3>=1.34.0" \
                 "pypdf>=5.1.0" \
+                "openai>=1.50.0" \
                 "json-repair>=0.46.2" \
                 "magika>=0.6.2" \
                 "fast-langdetect>=0.2.3" \
@@ -88,13 +89,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                 "pyclipper>=1.3.0" \
     --no-deps -i ${PIP_MIRROR} --break-system-packages
 
-# Step 6: [补全] 安装 requirements.txt (过滤掉已手动安装的重型包)
+# Step 6: [补全] 安装 requirements.txt (增加 openai 过滤防止冲突)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /paddleocr/d; /huggingface/d; /boto3/d; /pypdf/d' /tmp/requirements.txt && \
+    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /albumentations/d; /transformers/d; /tokenizers/d; /vllm/d; /flash_attn/d; /paddlex/d; /doclayout/d; /scikit-image/d; /paddleocr/d; /huggingface/d; /boto3/d; /pypdf/d; /openai/d' /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt -i ${PIP_MIRROR} --break-system-packages
 
-# Step 7: [最终验证] 检查关键包安装情况 (跳过构建时不可用的 paddle import)
-RUN python -c "import torch; import pypdf; import boto3; print('✅ Core Deps Verified')" && \
+# Step 7: [最终验证] 
+RUN python -c "import torch; import pypdf; import boto3; import openai; print('✅ All Backend Dependencies Verified')" && \
     pip show paddlepaddle-gpu paddleocr paddlex mineru | grep Version
 
 # -----------------------------------------------------------------------------
@@ -112,7 +113,6 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/init-models.sh &
 
 WORKDIR /app/backend
 
-# 暴露端口 (API, Worker, MCP)
 EXPOSE 8000 8001 8002
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
