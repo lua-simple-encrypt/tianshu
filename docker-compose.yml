@@ -44,7 +44,9 @@ services:
     container_name: tianshu-backend
     restart: unless-stopped
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_PORT:-8090}:8000"
+    env_file:
+      - .env  # [关键修复] 必须声明加载 .env 文件
     volumes:
       - "D:/aiworkspace/models/mineru:/root/.cache/mineru/models:ro"
       - ./backend/mineru.json:/root/mineru.json:ro
@@ -53,6 +55,7 @@ services:
       - TZ=Asia/Shanghai
       - MINERU_MODEL_SOURCE=local
       - DATABASE_PATH=/app/data/db/mineru_tianshu.db
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY} # [关键修复] 显式传递密钥
     deploy:
       resources:
         reservations:
@@ -76,6 +79,8 @@ services:
     command: ["python", "litserve_worker.py"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    env_file:
+      - .env  # [关键修复] Worker 也需要密钥来解析任务指令
     volumes:
       - "D:/aiworkspace/models/mineru:/root/.cache/mineru/models:ro"
       - ./data:/app/data:rw
@@ -84,6 +89,7 @@ services:
       - PADDLE_VLM_URL=http://host.docker.internal:8118/v1
       - MINERU_VLM_URL=http://host.docker.internal:8119/v1
       - PDF_SPLIT_THRESHOLD_PAGES=50
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY} # [关键修复] 
     deploy:
       resources:
         reservations:
@@ -109,7 +115,8 @@ services:
     ports:
       - "${FRONTEND_PORT:-80}:80"
     environment:
-      - VITE_API_BASE_URL=http://localhost:8000
+      # [关键修复] 必须指向宿主机暴露的 8090 端口，浏览器才能连上 API
+      - VITE_API_BASE_URL=http://localhost:8090
     networks:
       - tianshu-network
     depends_on:
@@ -119,7 +126,6 @@ networks:
   tianshu-network:
     driver: bridge
 
-# 注意：下面的每一项都必须顶格写，不能有额外的空格
 volumes:
   redis-data:
   rustfs-data:
